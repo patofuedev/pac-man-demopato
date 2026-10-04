@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>PATOMAN</title>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#050510;overflow:hidden;touch-action:none}
+  body{display:flex;align-items:center;justify-content:center}
+  #wrap{position:relative}
+  canvas{display:block;image-rendering:pixelated;background:#000}
+  #wrap::after{ /* scanlines CRT */
+    content:"";position:absolute;inset:0;pointer-events:none;
+    background:repeating-linear-gradient(to bottom,rgba(0,0,0,0) 0,rgba(0,0,0,0) 2px,rgba(0,0,0,.18) 3px);
+    box-shadow:inset 0 0 60px rgba(0,0,0,.6)}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+"use strict";
+// ---------- Configuración ----------
+const T = 24, COLS = 19, ROWS = 21, OY = 40;
+const W = COLS * T, H = ROWS * T + OY + 30;
+const MAP = [
+"###################",
+"#........#........#",
+"#o##.###.#.###.##o#",
+"#.................#",
+"#.##.#.#####.#.##.#",
+"#....#...#...#....#",
+"####.###.#.###.####",
+"####.#.......#.####",
+"####.#.##-##.#.####",
+".......#GGG#.......",
+"####.#.#####.#.####",
+"####.#.......#.####",
+"####.#.#####.#.####",
+"#........#........#",
+"#.##.###.#.###.##.#",
+"#o.#.....P.....#.o#",
+"##.#.#.#####.#.#.##",
+"#....#...#...#....#",
+"#.######.#.######.#",
+"#.................#",
+"###################"];
+const DIR = [[-1,0],[1,0],[0,-1],[0,1]]; // izq, der, arriba, abajo (i^1 = opuesto)
+const FOX_COLORS = ['#e8312f','#ff8fd0','#2fd8e8','#ff9a20'];
+const FOX_NAMES = ['ROJO','ROSA','AZUL','NARANJA'];
+
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+function resize(){
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = Math.floor(W * s) + 'px';
+  cv.style.height = Math.floor(H * s) + 'px';
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Sprites pixel art ----------
+function makeSprite(rows, pal){
+  const c = document.createElement('canvas');
+  c.width = rows[0].length; c.height = rows.length;
+  const g = c.getContext('2d');
+  rows.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (ch !== '.' && pal[ch]) { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); }
+  }));
+  return c;
+}
+const DUCK_PAL = {y:'#ffd800', o:'#ff7a00', k:'#101010', w:'#fff6c0'};
+const DUCK_BODY = [
+"....yyyy....",
+"...yyyyyy...",
+"...yykyyy...",
+null, null,
+"....yyyy....",
+"..yyyyyy....",
+".yyyyyyyyy..",
+"yyywwyyyyy..",
+".yywwyyyyy..",
+"..yyyyyyy...",
+null];
+function duckFrame(open, feetA){
+  const r = DUCK_BODY.slice();
+  r[3] = open ? "...yyyyyooo." : "...yyyyyoo..";
+  r[4] = open ? "...yyyyyooo." : "...yyyyyyo..";
+  r[11] = feetA ? "...o..o....." : "....o.o.....";
+  return makeSprite(r, DUCK_PAL);
+}
+const DUCK = [duckFrame(true,true), duckFrame(false,false)];
+
+const FOX_BODY = [
+"..c......c..",
+".ccc....ccc.",
+".cccccccccc.",
+".cwwccccwwc.",
+".cwkccccwkc.",
+".cccccccccc.",
+"..ccwwwwcc..",
+"..cwwkkwwc..",
+".cccwwwwccc.",
+".cccccccccc.",
+".cccccccccc.",
+null];
+function foxFrame(color, f, eyes){
+  const r = FOX_BODY.slice();
+  r[11] = f ? ".cc.cc.cc.c." : "c.cc.cc.cc.c";
+  return makeSprite(r, {c:color, w: eyes||'#ffffff', k:'#101010'});
+}
+const FOX = FOX_COLORS.map(c => [foxFrame(c,0), foxFrame(c,1)]);
+const FOX_SCARED = [foxFrame('#2121de',0,'#ffffff'), foxFrame('#2121de',1,'#ffffff')];
+const FOX_FLASH = [foxFrame('#f4f4f4',0,'#d02020'), foxFrame('#f4f4f4',1,'#d02020')];
+const EYES = makeSprite([
+"............","............","............",
+"..ww....ww..",".wwkw..wwkw.",".wwww..wwww.","..ww....ww..",
+"............","............","............","............","............"],
+{w:'#ffffff', k:'#2040ff'});
+
+// ---------- Audio ----------
+let ac = null, muted = false;
+function beep(f, d, type='square', vol=.05, f2){
+  if (!ac || muted) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, ac.currentTime);
+  if (f2) o.frequency.linearRampToValueAtTime(f2, ac.currentTime + d);
+  g.gain.setValueAtTime(vol, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(.001, ac.currentTime + d);
+  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + d);
+}
+let chompToggle = false;
+const sfx = {
+  dot(){ chompToggle = !chompToggle; beep(chompToggle ? 440 : 330, .07); },
+  power(){ beep(300, .25, 'sawtooth', .08, 160); },
+  eat(){ beep(200, .2, 'square', .07, 900); },
+  die(){ beep(700, .9, 'sawtooth', .07, 80); },
+  start(){ [262,330,392,523].forEach((f,i)=>setTimeout(()=>beep(f,.15),i*140)); },
+  win(){ [523,659,784,1047].forEach((f,i)=>setTimeout(()=>beep(f,.15),i*120)); }
+};
+
+// ---------- Estado ----------
+let grid, dotsLeft, score, hi, lives, level, state, stateT, frightT, modeT, scatter, ghostCombo, frame = 0;
+try { hi = +localStorage.getItem('patoman-hi') || 0; } catch(e){ hi = 0; }
+let duck, foxes = [], want = -1, dist;
+
+const mod = (a, n) => ((a % n) + n) % n;
+function cellAt(c, r){ if (r < 0 || r >= ROWS) return '#'; return grid[r][mod(c, COLS)]; }
+function walkable(c, r, door){ const ch = cellAt(c, r); return ch !== '#' && (ch !== '-' || door); }
+
+function buildBFS(){ // distancias desde la casa para los zorros "comidos"
+  dist = Array.from({length: ROWS}, () => Array(COLS).fill(1e9));
+  const q = [[9, 9]]; dist[9][9] = 0;
+  while (q.length){
+    const [c, r] = q.shift();
+    for (const [dx, dy] of DIR){
+      const nc = mod(c + dx, COLS), nr = r + dy;
+      if (nr < 0 || nr >= ROWS || !walkable(nc, nr, true) || dist[nr][nc] < 1e9) continue;
+      dist[nr][nc] = dist[r][c] + 1; q.push([nc, nr]);
+    }
+  }
+}
+
+function newLevel(){
+  grid = MAP.map(r => [...r]); dotsLeft = 0;
+  grid.forEach(r => r.forEach(ch => { if (ch === '.' || ch === 'o') dotsLeft++; }));
+  grid[15][9] = ' ';
+  buildBFS(); resetActors();
+}
+function resetActors(){
+  duck = {x: 9*T, y: 15*T, dir: -1, speed: 2, face: 1, anim: 0};
+  want = -1;
+  const starts = [[9,7,'normal',0],[8,9,'house',2],[9,9,'house',5],[10,9,'house',8]];
+  foxes = starts.map(([c, r, st, t], i) => ({
+    i, x: c*T, y: r*T, dir: st === 'normal' ? 1 : -1, state: st, timer: t*60,
+    fright: false, bob: 0
+  }));
+  frightT = 0; scatter = true; modeT = 7*60; ghostCombo = 0;
+  state = 'ready'; stateT = 120; sfx.start();
+}
+function newGame(){
+  score = 0; lives = 3; level = 1; newLevel();
+}
+
+// ---------- Movimiento ----------
+function advance(e, choose, door){
+  let move = e.speed;
+  while (move > 1e-6){
+    if (mod(e.x, T) < 1e-3 && mod(e.y, T) < 1e-3){
+      e.x = Math.round(e.x / T) * T; e.y = Math.round(e.y / T) * T;
+      choose(e);
+      if (e.dir < 0) return;
+      const [dx, dy] = DIR[e.dir];
+      if (!walkable(e.x/T + dx, e.y/T + dy, door())){ e.dir = -1; return; }
+    }
+    const [dx, dy] = DIR[e.dir];
+    const mx = mod(e.x, T), my = mod(e.y, T);
+    const rem = dx > 0 ? T - mx : dx < 0 ? (mx || T) : dy > 0 ? T - my : (my || T);
+    const s = Math.min(move, rem);
+    e.x += dx * s; e.y += dy * s; move -= s;
+    if (e.x <= -T) e.x += W; else if (e.x >= W) e.x -= W;
+    e.x = Math.round(e.x * 1000) / 1000; e.y = Math.round(e.y * 1000) / 1000;
+  }
+}
+
+function updateDuck(){
+  if (want >= 0 && duck.dir >= 0 && want === (duck.dir ^ 1)) duck.dir = want; // reversa instantánea
+  advance(duck, e => {
+    const c = e.x / T, r = e.y / T;
+    if (want >= 0 && walkable(c + DIR[want][0], r + DIR[want][1], false)) e.dir = want;
+    else if (e.dir >= 0 && !walkable(c + DIR[e.dir][0], r + DIR[e.dir][1], false)) e.dir = -1;
+  }, () => false);
+  if (duck.dir === 0) duck.face = -1; else if (duck.dir === 1) duck.face = 1;
+  if (duck.dir >= 0) duck.anim += duck.speed;
+  // comer
+  const c = mod(Math.floor((duck.x + T/2) / T), COLS), r = Math.floor((duck.y + T/2) / T);
+  const ch = grid[r] && grid[r][c];
+  if (ch === '.'){ grid[r][c] = ' '; score += 10; dotsLeft--; sfx.dot(); }
+  else if (ch === 'o'){
+    grid[r][c] = ' '; score += 50; dotsLeft--; sfx.power();
+    frightT = Math.max(2.5, 7 - level * .6) * 60; ghostCombo = 0;
+    foxes.forEach(f => { if (f.state !== 'eaten'){ f.fright = true; if (f.state === 'normal' && f.dir >= 0) f.dir ^= 1; } });
+  }
+  if (score > hi){ hi = score; try { localStorage.setItem('patoman-hi', hi); } catch(e){} }
+}
+
+function foxTarget(f){
+  const dc = duck.x / T, dr = duck.y / T;
+  const corners = [[17,0],[1,0],[17,20],[1,20]];
+  if (scatter) return corners[f.i];
+  const [dx, dy] = duck.dir >= 0 ? DIR[duck.dir] : [0, 0];
+  switch (f.i){
+    case 0: return [dc, dr];
+    case 1: return [dc + dx*4, dr + dy*4];
+    case 2: return [dc + Math.sin(frame/50)*6, dr + Math.cos(frame/50)*6];
+    default: return Math.hypot(f.x/T - dc, f.y/T - dr) > 6 ? [dc, dr] : corners[3];
+  }
+}
+
+function updateFox(f){
+  const baseSpeed = Math.min(2, 1.6 + level * .08);
+  if (f.state === 'house'){
+    f.bob += .15; f.y = 9*T + Math.sin(f.bob) * 3;
+    if (--f.timer <= 0){ f.state = 'leaving'; f.y = 9*T; }
+    return;
+  }
+  if (f.state === 'leaving'){
+    const s = 1.2, tx = 9*T;
+    if (f.x !== tx){ f.x += Math.sign(tx - f.x) * Math.min(s, Math.abs(tx - f.x)); }
+    else if (f.y > 7*T){ f.y = Math.max(7*T, f.y - s); }
+    else { f.state = 'normal'; f.dir = Math.random() < .5 ? 0 : 1; }
+    return;
+  }
+  f.speed = f.state === 'eaten' ? 4 : f.fright ? 1.1 : baseSpeed;
+  advance(f, e => {
+    const c = e.x / T, r = e.y / T;
+    if (e.state === 'eaten' && c === 9 && r === 9){ e.state = 'leaving'; e.fright = false; e.dir = -1; return; }
+    const door = e.state === 'eaten';
+    let opts = [0,1,2,3].filter(i => walkable(c + DIR[i][0], r + DIR[i][1], door) && i !== (e.dir ^ 1));
+    if (!opts.length) opts = [0,1,2,3].filter(i => walkable(c + DIR[i][0], r + DIR[i][1], door));
+    if (e.state === 'eaten'){
+      e.dir = opts.reduce((a, b) => dist[r+DIR[b][1]][mod(c+DIR[b][0],COLS)] < dist[r+DIR[a][1]][mod(c+DIR[a][0],COLS)] ? b : a);
+    } else if (e.fright){
+      e.dir = opts[Math.floor(Math.random() * opts.length)];
+    } else {
+      const [tx, ty] = foxTarget(e);
+      let best = 1e9;
+      for (const i of [2,0,3,1]){
+        if (!opts.includes(i)) continue;
+        const d = (c + DIR[i][0] - tx) ** 2 + (r + DIR[i][1] - ty) ** 2;
+        if (d < best){ best = d; e.dir = i; }
+      }
+    }
+  }, () => f.state === 'eaten');
+}
+
+function update(){
+  frame++;
+  if (state === 'ready'){ if (--stateT <= 0) state = 'play'; return; }
+  if (state === 'dying'){
+    if (--stateT <= 0){
+      if (--lives > 0) resetActors(); else { state = 'over'; }
+    }
+    return;
+  }
+  if (state === 'win'){
+    if (--stateT <= 0){ level++; newLevel(); }
+    return;
+  }
+  if (state !== 'play') return;
+
+  if (frightT > 0 && --frightT <= 0) foxes.forEach(f => f.fright = false);
+  else if (frightT <= 0 && --modeT <= 0){
+    scatter = !scatter; modeT = (scatter ? 7 : 20) * 60;
+    foxes.forEach(f => { if (f.state === 'normal' && f.dir >= 0) f.dir ^= 1; });
+  }
+  updateDuck();
+  foxes.forEach(updateFox);
+
+  for (const f of foxes){
+    if (f.state !== 'normal') continue;
+    if (Math.hypot(f.x - duck.x, f.y - duck.y) < 14){
+      if (f.fright){
+        f.state = 'eaten'; f.fright = false; ghostCombo++;
+        score += 200 * (1 << (ghostCombo - 1)); sfx.eat();
+      } else { state = 'dying'; stateT = 100; sfx.die(); return; }
+    }
+  }
+  if (dotsLeft <= 0){ state = 'win'; stateT = 140; sfx.win(); }
+}
+
+// ---------- Dibujo ----------
+function text(s, x, y, color='#fff', align='left', size=8){
+  ctx.font = `${size}px "Press Start 2P", monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#000'; ctx.fillText(s, x + 1, y + 1);
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function sprite(img, x, y, flip){
+  ctx.save();
+  if (flip){ ctx.translate(x + T, y); ctx.scale(-1, 1); ctx.drawImage(img, 0, 0, T, T); }
+  else ctx.drawImage(img, x, y, T, T);
+  ctx.restore();
+}
+function drawMaze(){
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++){
+    const ch = grid[r][c], x = c*T, y = r*T + OY;
+    if (ch === '#'){
+      ctx.fillStyle = '#0a0a48'; ctx.fillRect(x, y, T, T);
+      ctx.fillStyle = '#3b6bff';
+      const open = (dc, dr) => cellAt(c+dc, r+dr) !== '#' && !(r+dr<0||r+dr>=ROWS);
+      if (open(0,-1)) ctx.fillRect(x, y, T, 3);
+      if (open(0, 1)) ctx.fillRect(x, y+T-3, T, 3);
+      if (open(-1,0)) ctx.fillRect(x, y, 3, T);
+      if (open(1, 0)) ctx.fillRect(x+T-3, y, 3, T);
+    } else if (ch === '-'){
+      ctx.fillStyle = '#ff9ad0'; ctx.fillRect(x, y + T/2 - 2, T, 4);
+    } else if (ch === '.'){
+      ctx.fillStyle = '#ffe9a8'; ctx.fillRect(x + T/2 - 2, y + T/2 - 2, 4, 4);
+    } else if (ch === 'o' && (frame >> 4) % 2 === 0){ // maíz parpadeante
+      ctx.fillStyle = '#ffb000'; ctx.fillRect(x + 6, y + 6, 12, 12);
+      ctx.fillStyle = '#fff07a'; ctx.fillRect(x + 8, y + 8, 4, 4); ctx.fillRect(x + 14, y + 12, 2, 2);
+      ctx.fillStyle = '#3aa832'; ctx.fillRect(x + 6, y + 16, 12, 2);
+    }
+  }
+}
+function drawDuck(){
+  const x = duck.x, y = duck.y + OY;
+  if (state === 'dying'){
+    const p = 1 - stateT / 100;
+    ctx.save(); ctx.translate(x + T/2, y + T/2); ctx.rotate(p * Math.PI * 6);
+    ctx.scale(1 - p, 1 - p); ctx.translate(-T/2, -T/2);
+    ctx.drawImage(DUCK[0], 0, 0, T, T); ctx.restore(); return;
+  }
+  sprite(DUCK[Math.floor(duck.anim / 5) % 2], x, y, duck.face < 0);
+}
+function drawFoxes(){
+  for (const f of foxes){
+    const x = f.x, y = f.y + OY, k = (frame >> 3) % 2;
+    if (f.state === 'eaten') sprite(EYES, x, y);
+    else if (f.fright){
+      const flash = frightT < 120 && (frame >> 4) % 2;
+      sprite((flash ? FOX_FLASH : FOX_SCARED)[k], x, y);
+    } else sprite(FOX[f.i][k], x, y);
+  }
+}
+function drawHUD(){
+  text('1UP', 8, 6, '#ff9ad0'); text(String(score).padStart(6,'0'), 8, 20);
+  text('RECORD', W/2, 6, '#ff9ad0', 'center'); text(String(hi).padStart(6,'0'), W/2, 20, '#fff', 'center');
+  text('NIVEL ' + level, W - 8, 6, '#ff9ad0', 'right');
+  for (let i = 0; i < lives - (state === 'dying' ? 1 : 0); i++) ctx.drawImage(DUCK[1], 6 + i*26, H - 28, 24, 24);
+  text(muted ? 'M: SONIDO OFF' : 'M: SONIDO ON', W - 8, H - 18, '#667', 'right', 7);
+}
+function overlay(lines){
+  ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(0, OY + 7*T, W, 6*T);
+  lines.forEach(([s, col, size], i) => text(s, W/2, OY + 7*T + 18 + i*28, col, 'center', size || 10));
+}
+function draw(){
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  if (state === 'title'){
+    text('PATOMAN', W/2, 90, '#ffd800', 'center', 28);
+    ctx.drawImage(DUCK[(frame >> 4) % 2], W/2 - 48, 150, 96, 96);
+    FOX.forEach((f, i) => ctx.drawImage(f[(frame >> 3) % 2], 60 + i*88, 270, 48, 48));
+    text('COME TODAS LAS MIGAS', W/2, 350, '#ffe9a8', 'center');
+    text('Y EVITA A LOS ZORROS', W/2, 372, '#ffe9a8', 'center');
+    text('EL MAIZ TE DA PODER', W/2, 394, '#ffb000', 'center');
+    text('FLECHAS / WASD / DESLIZAR', W/2, 440, '#7fa0ff', 'center', 7);
+    if ((frame >> 5) % 2 === 0) text('PULSA ESPACIO', W/2, 480, '#fff', 'center', 12);
+    text('RECORD ' + String(hi).padStart(6,'0'), W/2, 530, '#ff9ad0', 'center');
+    return;
+  }
+  drawMaze(); drawFoxes(); drawDuck(); drawHUD();
+  if (state === 'ready') overlay([['JUGADOR 1','#00e8e8'],['¡LISTO!','#ffd800',14]]);
+  if (state === 'win') overlay([['¡NIVEL SUPERADO!','#ffd800',11],['CUAC CUAC CUAC','#fff',9]]);
+  if (state === 'over') overlay([['FIN DEL JUEGO','#ff3030',14],['PULSA ESPACIO','#fff',9]]);
+  if (state === 'paused') overlay([['PAUSA','#fff',14],['PULSA P','#7fa0ff',9]]);
+}
+
+// ---------- Entrada ----------
+const KEYS = {ArrowLeft:0,a:0,A:0,ArrowRight:1,d:1,D:1,ArrowUp:2,w:2,W:2,ArrowDown:3,s:3,S:3};
+function startOrRestart(){
+  if (!ac) try { ac = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){}
+  if (state === 'title' || state === 'over') newGame();
+}
+addEventListener('keydown', e => {
+  if (e.key in KEYS){ want = KEYS[e.key]; e.preventDefault(); }
+  else if (e.key === ' ' || e.key === 'Enter'){ startOrRestart(); e.preventDefault(); }
+  else if (e.key === 'p' || e.key === 'P'){
+    if (state === 'play') { state = 'paused'; } else if (state === 'paused') state = 'play';
+  } else if (e.key === 'm' || e.key === 'M') muted = !muted;
+});
+let tx0, ty0;
+addEventListener('touchstart', e => { tx0 = e.touches[0].clientX; ty0 = e.touches[0].clientY; startOrRestart(); });
+addEventListener('touchmove', e => {
+  const dx = e.touches[0].clientX - tx0, dy = e.touches[0].clientY - ty0;
+  if (Math.hypot(dx, dy) < 24) return;
+  want = Math.abs(dx) > Math.abs(dy) ? (dx < 0 ? 0 : 1) : (dy < 0 ? 2 : 3);
+  tx0 = e.touches[0].clientX; ty0 = e.touches[0].clientY;
+}, {passive: true});
+
+// ---------- Bucle (paso fijo 60 Hz) ----------
+state = 'title';
+let last = performance.now(), acc = 0;
+function loop(now){
+  acc += Math.min(100, now - last); last = now;
+  while (acc >= 1000/60){ if (state === 'title') frame++; else update(); acc -= 1000/60; }
+  draw(); requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
